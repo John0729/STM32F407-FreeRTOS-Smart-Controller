@@ -1,10 +1,10 @@
 <div align="center">
 
-# STM32F407 Smart Controller
+# STM32F407 FreeRTOS Smart Controller
 
-### Multi-Peripheral Embedded Control System
+### Multi-Task Embedded Control System
 
-**STM32F407VGT6 · C · STM32 HAL · DMA · UART · I2C · SPI · PWM · EXTI**
+**STM32F407VGT6 · FreeRTOS · CMSIS-RTOS2 · C · STM32 HAL · DMA · UART · I2C · SPI · PWM · EXTI**
 
 A modular embedded firmware project integrating sensor acquisition,  
 command control, automatic PWM regulation, OLED monitoring,  
@@ -17,23 +17,32 @@ state management, and fault handling.
 ## Overview
 
 This project implements a complete embedded control system on the
-**STM32F407VGT6**.
+**STM32F407VGT6** using **FreeRTOS with CMSIS-RTOS2**.
 
-Instead of demonstrating peripherals independently, the project integrates
-multiple STM32 peripherals into a single application with a structured
-firmware architecture.
+The project was first developed as a bare-metal super-loop application and was
+then migrated to a multi-task RTOS architecture. Sensor acquisition, control
+logic, UART communication, display updates, and background processing are
+separated into dedicated tasks.
 
 ### Highlights
 
-- ADC continuous sampling with **DMA**
-- UART command interface using **DMA + IDLE detection**
+- FreeRTOS / CMSIS-RTOS2 multi-task architecture
+- Dedicated `ControlTask`, `SensorTask`, `UARTTask`, `DisplayTask`, and `BackgroundTask`
+- UART RX using **DMA + IDLE detection**
+- ISR-to-task wake-up using **Thread Flags**
+- UART control commands transferred through a **Message Queue**
+- Control responses transferred through a **Response Queue**
+- Fault reports transferred using **Event Flags**
+- ADC continuous sampling using **DMA**
 - LM75 temperature sensing through **I2C**
 - SSD1306 OLED display through **SPI**
-- Hardware PWM generation with **TIM2**
+- Hardware PWM generation using **TIM2 CH2**
 - USER button input using **EXTI**
 - `INIT / IDLE / MANUAL / AUTO / FAULT` state machine
-- Centralized fault manager
+- Centralized runtime fault handling
 - Automatic fail-safe PWM shutdown
+- LM75 / I2C recovery after sensor reconnection
+- Runtime stack high-water validation
 - Human-readable ASCII command interface
 - Modular `.c / .h` firmware structure
 
@@ -42,35 +51,81 @@ firmware architecture.
 ## System Architecture
 
 ```mermaid
-flowchart TD
+flowchart TB
 
     PC[PC / Serial Terminal]
-    UART[UART Protocol Handler]
-    APP[Application Control]
-    STATE[State Machine]
+
+    UARTTASK[UARTTask<br/>Normal Priority<br/>Event Driven]
+    CONTROLTASK[ControlTask<br/>AboveNormal Priority<br/>20 ms + Events]
+    SENSORTASK[SensorTask<br/>Normal Priority<br/>500 ms + Recovery Event]
+    DISPLAYTASK[DisplayTask<br/>Low Priority<br/>200 ms]
+    BGTASK[BackgroundTask<br/>Normal Priority<br/>~1 ms]
+
+    CMDQ[Command Queue]
+    RESPQ[Response Queue]
+    FAULTEVT[Fault Event Flags]
+
+    USART[USART2<br/>DMA + IDLE]
+    LM75[LM75<br/>I2C1]
+    OLED[SSD1306<br/>SPI2]
+    PWM[TIM2 CH2<br/>PWM]
+    ADC[ADC1 + DMA]
+    BUTTON[PA0 EXTI]
+    STATE[System State]
     FAULT[Fault Manager]
 
-    ADC[ADC + DMA]
-    TEMP[LM75 / I2C]
-    OLED[SSD1306 / SPI]
-    PWM[TIM2 PWM]
-    BUTTON[PA0 EXTI]
+    PC <--> USART
+    USART <--> UARTTASK
 
-    PC --> UART
-    UART --> APP
+    UARTTASK --> CMDQ
+    CMDQ --> CONTROLTASK
 
-    BUTTON --> APP
+    CONTROLTASK --> RESPQ
+    RESPQ --> UARTTASK
 
-    APP --> STATE
-    APP --> FAULT
+    SENSORTASK --> FAULTEVT
+    UARTTASK --> FAULTEVT
+    FAULTEVT --> CONTROLTASK
 
-    ADC --> APP
-    TEMP --> APP
+    CONTROLTASK -. Recovery Request .-> SENSORTASK
+    SENSORTASK -. Recovery Result .-> CONTROLTASK
 
-    APP --> PWM
-    APP --> OLED
-    APP --> LED
+    SENSORTASK <--> LM75
+    DISPLAYTASK --> OLED
+    BGTASK --> ADC
+    BUTTON --> BGTASK
+
+    CONTROLTASK --> PWM
+    CONTROLTASK --> STATE
+    CONTROLTASK --> FAULT
 ```
+
+### Resource Ownership
+
+| Resource / State | Runtime Owner |
+|---|---|
+| USART2 RX/TX | `UARTTask` |
+| I2C1 / LM75 | `SensorTask` |
+| SPI2 / SSD1306 OLED | `DisplayTask` |
+| System state | `ControlTask` |
+| PWM output | `ControlTask` |
+| Fault state | `ControlTask` |
+| ADC post-processing | `BackgroundTask` |
+| Button event handling | `BackgroundTask` |
+
+---
+
+## RTOS Tasks
+
+| Task | Priority | Period / Trigger | Responsibility |
+|---|---|---|---|
+| `ControlTask` | AboveNormal | 20 ms + asynchronous events | State machine, PWM control, critical fault handling, recovery result handling |
+| `SensorTask` | Normal | 500 ms + recovery request | LM75 acquisition, I2C ownership, sensor recovery |
+| `UARTTask` | Normal | Thread Flag events | UART RX processing, command parsing, UART TX |
+| `BackgroundTask` | Normal | ~1 ms | ADC DMA post-processing and button event handling |
+| `DisplayTask` | Low | 200 ms | OLED status rendering |
+
+The FreeRTOS tick rate is configured to **1000 Hz**.
 
 ---
 
@@ -207,28 +262,33 @@ MODE=MANUAL TEMP=25.5C ADC=2048 PWM=50 FAULT=0x0000
 
 ## ADC + DMA
 
-ADC1 continuously samples an analog input.
+ADC1 continuously samples an analog input using DMA.
 
-A DMA buffer stores:
+A circular DMA buffer stores:
 
 ```text
 32 samples
 ```
 
-After 32 ADC samples are transferred by DMA, the DMA completion callback signals the main loop to calculate the average.
+After the DMA buffer is completed, a lightweight callback marks new ADC data
+as available. `BackgroundTask` performs the averaging operation outside the ISR.
 
 ```mermaid
 flowchart LR
 
     ADC[ADC1]
     DMA[DMA Buffer<br/>32 Samples]
-    EVENT[DMA Complete]
-    AVG[Average<br/>32 Samples]
+    ISR[DMA Complete Callback]
+    FLAG[ADC Ready Flag]
+    BG[BackgroundTask]
+    AVG[Average 32 Samples]
     RESULT[ADC Result]
 
     ADC --> DMA
-    DMA --> EVENT
-    EVENT --> AVG
+    DMA --> ISR
+    ISR --> FLAG
+    FLAG --> BG
+    BG --> AVG
     AVG --> RESULT
 ```
 
@@ -238,7 +298,7 @@ Raw ADC range:
 0 ~ 4095
 ```
 
-The driver also provides voltage conversion:
+Voltage conversion:
 
 ```text
 Voltage (mV) = ADC × 3300 / 4095
@@ -248,39 +308,36 @@ Voltage (mV) = ADC × 3300 / 4095
 
 ## UART DMA Reception
 
-UART reception uses DMA together with UART IDLE detection. Received data is
-accumulated in a line buffer until a CR (`\r`) or LF (`\n`) terminator is detected.
+UART reception uses DMA together with UART IDLE detection.
+
+The RX event callback stores the received length and wakes `UARTTask` using a
+Thread Flag. Command parsing is then performed in task context.
 
 ```mermaid
 flowchart LR
 
-    RX[UART RX]
-    DMA[DMA Buffer]
-    EVENT[RX Event Callback]
-    PROCESS[Process Received Bytes]
+    RX[USART2 RX]
+    DMA[DMA RX Buffer]
+    ISR[RX Event Callback]
+    FLAG[UART_RX_EVENT_FLAG]
+    TASK[UARTTask]
     LINE[Command Line Buffer]
-    CHECK{CR / LF?}
     PARSER[ASCII Parser]
-    APP[Application]
-    NEXT{All Bytes Processed?}
+    CMDQ[Command Queue]
+    CONTROL[ControlTask]
 
     RX --> DMA
-    DMA --> EVENT
-    EVENT --> PROCESS
-    PROCESS --> LINE
-    LINE --> CHECK
-
-    CHECK -->|No| NEXT
-    CHECK -->|Yes| PARSER
-    PARSER --> APP
-    APP --> NEXT
-
-    NEXT -->|No| PROCESS
-    NEXT -->|Yes / Re-arm DMA| RX
+    DMA --> ISR
+    ISR --> FLAG
+    FLAG --> TASK
+    TASK --> LINE
+    LINE --> PARSER
+    PARSER --> CMDQ
+    CMDQ --> CONTROL
 ```
 
-This avoids continuously polling the UART peripheral while supporting
-variable-length ASCII commands.
+Control responses are returned through a separate Response Queue so USART2 TX
+remains owned by `UARTTask`.
 
 ---
 
@@ -288,30 +345,24 @@ variable-length ASCII commands.
 
 The firmware uses a centralized fault bitmask.
 
-Current fault conditions include:
-
 | Fault | Critical |
 |---|---|
 | Temperature sensor communication failure | Yes |
 | Invalid UART command | No |
 | Invalid parameter | No |
 
-A critical temperature sensor failure triggers:
+Runtime fault reports from `SensorTask` and `UARTTask` are forwarded through
+RTOS Event Flags. `ControlTask` is the single runtime writer of the fault state.
 
-```mermaid
-flowchart LR
+The LM75 must fail for **three consecutive sensor cycles** before a critical
+temperature-sensor fault is reported.
 
-    ERROR[Sensor Failure]
-    FAULT[Set Fault]
-    STATE[Enter FAULT]
-    PWM[PWM = 0%]
+A critical fault forces:
 
-    ERROR --> FAULT
-    FAULT --> STATE
-    STATE --> PWM
+```text
+State = FAULT
+PWM   = 0%
 ```
-
-This provides a basic fail-safe mechanism.
 
 ### Recovery
 
@@ -321,15 +372,27 @@ The user can issue:
 CLEAR
 ```
 
-The firmware clears the fault flags and re-checks the temperature sensor.
+`ControlTask` sends a recovery request to `SensorTask`. Since `SensorTask` owns
+I2C1, sensor recovery remains in the same task.
 
-If the sensor responds correctly:
+The recovery sequence is:
+
+```text
+HAL_I2C_DeInit()
+→ HAL_I2C_Init()
+→ LM75 ready check
+→ temperature read
+→ report recovery result to ControlTask
+```
+
+If recovery succeeds:
 
 ```text
 FAULT → IDLE
+PWM   = 0%
 ```
 
-Otherwise the controller remains in the fault condition.
+If recovery fails, the controller remains in `FAULT`.
 
 ---
 
@@ -392,6 +455,7 @@ PCLK2  : 84 MHz
 ```text
 Core/
 ├── Inc/
+│   ├── FreeRTOSConfig.h
 │   ├── analog_input.h
 │   ├── fault_manager.h
 │   ├── oled.h
@@ -403,12 +467,18 @@ Core/
 └── Src/
     ├── analog_input.c
     ├── fault_manager.c
+    ├── freertos.c
     ├── main.c
     ├── oled.c
     ├── protocol.c
     ├── pwm.c
+    ├── stm32f4xx_hal_timebase_tim.c
     ├── system_state.c
     └── temperature_sensor.c
+
+Middlewares/
+└── Third_Party/
+    └── FreeRTOS/
 ```
 
 ### Module Responsibilities
@@ -416,65 +486,90 @@ Core/
 | Module | Responsibility |
 |---|---|
 | `analog_input` | ADC DMA acquisition and averaging |
-| `temperature_sensor` | LM75 I2C communication |
+| `temperature_sensor` | LM75 I2C communication and recovery |
 | `pwm` | PWM generation and duty control |
-| `oled` | SSD1306 display driver |
+| `oled` | SSD1306 SPI display driver |
 | `protocol` | UART ASCII command parser |
 | `system_state` | State transition management |
-| `fault_manager` | Fault detection and storage |
-| `main` | Application scheduling and coordination |
+| `fault_manager` | Fault bitmask storage and queries |
+| `main` | Hardware initialization, RTOS object creation, task entry functions, application coordination |
+| `freertos` | FreeRTOS hooks and CubeMX-generated RTOS support |
+| `FreeRTOSConfig.h` | FreeRTOS kernel configuration |
 
 ---
 
-## Firmware Architecture
+## FreeRTOS Configuration
 
-```mermaid
-flowchart TB
-
-    LOOP[Main Loop]
-    ADC[Process ADC]
-    SENSOR[Process Temperature Sensor]
-    FAULT1[Check Critical Fault]
-    CONTROL[Process Control]
-    DISPLAY[Update OLED]
-    FAULT2[Check Critical Fault]
-    BUTTON[Process Button Event]
-    UART[Process UART Event]
-
-    LOOP --> ADC
-    ADC --> SENSOR
-    SENSOR --> FAULT1
-    FAULT1 --> CONTROL
-    CONTROL --> DISPLAY
-    DISPLAY --> FAULT2
-    FAULT2 --> BUTTON
-    BUTTON --> UART
-    UART --> LOOP
+```text
+Tick Rate                      : 1000 Hz
+Stack Overflow Check           : Mode 2
+Newlib Reentrancy              : Enabled
+Heap Implementation            : heap_4
+FreeRTOS Heap Size             : 15360 bytes
+Max Syscall Interrupt Priority : 5
+HAL Time Base                  : TIM6
 ```
 
-DMA and interrupts handle asynchronous peripheral events, while application
-logic remains primarily in the main loop.
+---
+
+## Runtime Stack Validation
+
+Each application task is allocated:
+
+```text
+1024 bytes
+```
+
+Stack usage was validated with `osThreadGetStackSpace()` after normal
+operation, UART command handling, invalid commands, sensor fault injection,
+failed recovery, successful recovery, and OLED updates.
+
+| Task | Allocated Stack | Minimum Observed Free Stack | Approx. Maximum Used |
+|---|---:|---:|---:|
+| `BackgroundTask` | 1024 B | 864 B | 160 B |
+| `SensorTask` | 1024 B | 736 B | 288 B |
+| `DisplayTask` | 1024 B | 520 B | 504 B |
+| `ControlTask` | 1024 B | 296 B | 728 B |
+| `UARTTask` | 1024 B | 624 B | 400 B |
+
+`ControlTask` showed the highest stack usage while still retaining about
+29% stack headroom during regression testing.
 
 ---
 
 ## Design Principles
 
-### Keep Interrupts Lightweight
+### Keep ISRs Lightweight
 
-Interrupt callbacks mainly set flags:
+Interrupt callbacks perform minimal work and defer application processing to
+tasks.
 
-```c
-button_event = 1;
+Examples:
+
+```text
+UART RX Event ISR
+→ store RX length
+→ set UARTTask Thread Flag
+
+EXTI ISR
+→ set button event flag
 ```
 
-The main loop performs the actual application processing.
+### Use the Appropriate RTOS Primitive
 
-This keeps interrupt execution short and predictable.
+- **Thread Flags**: task wake-up and event notification
+- **Message Queues**: ordered command and response transfer
+- **Event Flags**: aggregated fault reporting
 
-### Separate Drivers from Application Logic
+### Single-Owner Resources
 
-Peripheral-specific logic is separated into dedicated modules instead of
-placing everything inside `main.c`.
+```text
+USART2      → UARTTask
+I2C1 / LM75 → SensorTask
+SPI2 / OLED → DisplayTask
+PWM / State → ControlTask
+Fault State → ControlTask
+```
 
 ### Fail-Safe Output
 
@@ -484,12 +579,9 @@ Critical faults force:
 PWM = 0%
 ```
 
-to prevent the actuator from continuing to operate when sensor feedback is
-unavailable.
-
 ### Integer-Based Temperature
 
-Temperature is stored internally as:
+Temperature is stored as:
 
 ```text
 Celsius × 10
@@ -500,8 +592,6 @@ Example:
 ```text
 25.5 °C → 255
 ```
-
-This allows control calculations without requiring floating-point arithmetic.
 
 ---
 
@@ -516,7 +606,7 @@ This allows control calculations without requiring floating-point arithmetic.
 Clone the repository:
 
 ```bash
-git clone https://github.com/John0729/STM32F407-Smart-Controller.git
+git clone https://github.com/John0729/STM32F407-FreeRTOS-Smart-Controller.git
 ```
 
 Import into STM32CubeIDE:
@@ -539,7 +629,7 @@ Build Project
 The CubeMX hardware configuration is stored in:
 
 ```text
-STM32F407VGT6_Smart_Controller.ioc
+STM32F407VGT6_RTOS_Smart_Controller.ioc
 ```
 
 ---
@@ -559,18 +649,19 @@ STM32F407VGT6_Smart_Controller.ioc
 8. TEMP
 9. AUTO
 10. Disconnect LM75
-11. STATUS
-12. Reconnect LM75
-13. CLEAR
+11. Wait for FAULT
+12. STATUS
+13. CLEAR while LM75 is disconnected
+14. Reconnect LM75
+15. CLEAR
+16. STATUS
+17. MANUAL / PWM 50 / STOP
 ```
-
-### Demo Video
-
-> Demo video will be added here.
 
 ### Hardware Setup
 
 ![Circuit](Hardware_setup.jpg)
+![Circuit](Hardware_setup2.jpg)
 
 ```mermaid
 flowchart LR
@@ -607,9 +698,19 @@ flowchart LR
 
 This project demonstrates practical experience with:
 
-`STM32` · `Embedded C` · `HAL` · `GPIO` · `EXTI` · `ADC` · `DMA`  
-`UART` · `I2C` · `SPI` · `PWM` · `Timers` · `State Machine`  
-`Fault Handling` · `Serial Protocol` · `Git`
+`STM32` · `Embedded C` · `FreeRTOS` · `CMSIS-RTOS2` · `Task Scheduling`  
+`Thread Flags` · `Message Queues` · `Event Flags` · `HAL` · `GPIO` · `EXTI`  
+`ADC` · `DMA` · `UART` · `I2C` · `SPI` · `PWM` · `Timers` · `State Machine`  
+`Fault Handling` · `Sensor Recovery` · `Stack Validation` · `Serial Protocol` · `Git`
 
 ---
 
+
+---
+
+## Project Status
+
+**Firmware implementation and hardware regression testing complete.**
+
+The firmware is currently in a code-freeze state. Remaining work is limited to
+documentation improvements and demo media.
