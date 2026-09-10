@@ -1,0 +1,33 @@
+# STM32CubeIDE build folders
+Debug/
+Release/
+
+# Build output files
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.map
+*.list
+*.bin
+*.hex
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+
+# Windows files
+Thumbs.db
+Desktop.ini
+
+# macOS files
+.DS_Store
+
+# Other editors
+.vscode/
+.idea/
+
+# STM32CubeIDE local debug configuration
+*.launch
