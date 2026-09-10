@@ -51,31 +51,27 @@ separated into dedicated tasks.
 ## System Architecture
 
 ```mermaid
-flowchart TB
+flowchart LR
+
+    %% =========================
+    %% UART Path
+    %% =========================
 
     PC[PC / Serial Terminal]
-
-    UARTTASK[UARTTask<br/>Normal Priority<br/>Event Driven]
-    CONTROLTASK[ControlTask<br/>AboveNormal Priority<br/>20 ms + Events]
-    SENSORTASK[SensorTask<br/>Normal Priority<br/>500 ms + Recovery Event]
-    DISPLAYTASK[DisplayTask<br/>Low Priority<br/>200 ms]
-    BGTASK[BackgroundTask<br/>Normal Priority<br/>~1 ms]
-
-    CMDQ[Command Queue]
-    RESPQ[Response Queue]
-    FAULTEVT[Fault Event Flags]
-
     USART[USART2<br/>DMA + IDLE]
-    LM75[LM75<br/>I2C1]
-    OLED[SSD1306<br/>SPI2]
-    PWM[TIM2 CH2<br/>PWM]
-    ADC[ADC1 + DMA]
-    BUTTON[PA0 EXTI]
-    STATE[System State]
-    FAULT[Fault Manager]
+    UARTTASK[UARTTask<br/>Normal Priority<br/>Event Driven]
 
     PC <--> USART
     USART <--> UARTTASK
+
+
+    %% =========================
+    %% Control Path
+    %% =========================
+
+    CMDQ[Command Queue]
+    CONTROLTASK[ControlTask<br/>AboveNormal Priority<br/>20 ms + Events]
+    RESPQ[Response Queue]
 
     UARTTASK --> CMDQ
     CMDQ --> CONTROLTASK
@@ -83,21 +79,64 @@ flowchart TB
     CONTROLTASK --> RESPQ
     RESPQ --> UARTTASK
 
-    SENSORTASK --> FAULTEVT
-    UARTTASK --> FAULTEVT
-    FAULTEVT --> CONTROLTASK
 
-    CONTROLTASK -. Recovery Request .-> SENSORTASK
-    SENSORTASK -. Recovery Result .-> CONTROLTASK
+    %% =========================
+    %% Sensor Path
+    %% =========================
+
+    SENSORTASK[SensorTask<br/>Normal Priority<br/>500 ms + Recovery Event]
+    LM75[LM75<br/>I2C1]
 
     SENSORTASK <--> LM75
-    DISPLAYTASK --> OLED
-    BGTASK --> ADC
-    BUTTON --> BGTASK
+
+    CONTROLTASK -. Recovery Req .-> SENSORTASK
+    SENSORTASK -. Recovery Result .-> CONTROLTASK
+
+
+    %% =========================
+    %% Fault Reporting
+    %% =========================
+
+    FAULTEVT[Fault Event Flags]
+
+    UARTTASK --> FAULTEVT
+    SENSORTASK --> FAULTEVT
+    FAULTEVT --> CONTROLTASK
+
+
+    %% =========================
+    %% Control Ownership
+    %% =========================
+
+    PWM[TIM2 CH2<br/>PWM]
+    STATE[System State]
+    FAULT[Fault Manager]
 
     CONTROLTASK --> PWM
     CONTROLTASK --> STATE
     CONTROLTASK --> FAULT
+
+
+    %% =========================
+    %% Display Path
+    %% =========================
+
+    DISPLAYTASK[DisplayTask<br/>Low Priority<br/>200 ms]
+    OLED[SSD1306<br/>SPI2]
+
+    DISPLAYTASK --> OLED
+
+
+    %% =========================
+    %% Background Path
+    %% =========================
+
+    ADC[ADC1 + DMA]
+    BUTTON[PA0 EXTI]
+    BGTASK[BackgroundTask<br/>Normal Priority<br/>~1 ms]
+
+    ADC --> BGTASK
+    BUTTON --> BGTASK
 ```
 
 ### Resource Ownership
